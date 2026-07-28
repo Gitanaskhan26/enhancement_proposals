@@ -1,16 +1,16 @@
-## Causal Discovery Benchmarkrking Infrastructure
+## Causal Discovery Benchmarking Infrastructure
 
 Contributors: @Gitanaskhan26
 
 ### Introduction
 
-pgmpy currently ships several causal discovery algorithms (`PC`, `GES`, `HillClimbSearch`, `TreeSearch`/`ChowLiu`/`TAN`, `ANM`, `TOPIC`, `ExpertInLoop`, `LLMPairwise`), all unified under a common `BaseCausalDiscovery` interface (`pgmpy/causal_discovery/_base.py`): every estimator exposes `.fit(X)`, populates a fitted `causal_graph_`, and exposes `.score(X=None, true_graph=None, metric=None)`. Separately, `pgmpy.metrics` now ships `BaseSupervisedMetric` / `BaseUnsupervisedMetric`, a `get_metrics(**tag_filters)` registry, and concrete metrics (`SHD`, `AdjacencyConfusionMatrix`, `OrientationConfusionMatrix`, `StructureScore`, `CorrelationScore`, `ImpliedCIs`, `FisherC`), each tagged with `requires_true_graph`, `requires_data`, and `lower_is_better`. The dataset side (this proposal's [Simulation Mixin proposal](../1_simulation_mixin/proposal.md)) has landed as `load_dataset()` / `list_datasets()` / `BaseSimulatedDataset`, with `has_ground_truth` / `is_simulated` tags.
+pgmpy currently ships several causal discovery algorithms (`PC`, `GES`, `HillClimbSearch`, `ChowLiu`, `TAN`, `ANM`, `TOPIC`, `ExpertInLoop`, `LLMPairwise`), all unified under a common `BaseCausalDiscovery` interface (`pgmpy/causal_discovery/_base.py`): every estimator exposes `.fit(X)`, populates a fitted `causal_graph_`, and exposes `.score(X=None, true_graph=None, metric=None)`. Separately, `pgmpy.metrics` now ships `BaseSupervisedMetric` / `BaseUnsupervisedMetric`, a `get_metrics(**tag_filters)` registry, and concrete metrics (`SHD`, `AdjacencyConfusionMatrix`, `OrientationConfusionMatrix`, `StructureScore`, `CorrelationScore`, `ImpliedCIs`, `FisherC`), each tagged with `requires_true_graph`, `requires_data`, and `lower_is_better`. The dataset side (this proposal's [Simulation Mixin proposal](../1_simulation_mixin/proposal.md)) has landed as `load_dataset()` / `list_datasets()` / `BaseSimulatedDataset`, with `has_ground_truth` / `is_simulated` tags.
 
 All the pieces to *run* a causal discovery method and *score* it against a dataset already exist. What's missing is a way to compare many of them at once. Today that means a one-off script per experiment. [CausalEval#7](https://github.com/pgmpy/CausalEval/pull/7) (open, unmerged) is a concrete example: it hard-codes a single Linear Gaussian dataset, `n=1000`, exactly two algorithms (PC, GES) in a sequential loop, and — because it predates the `.fit()`/`.score()`/metrics refactor above — it's already written against a superseded API (`PC(data).estimate(...)`, a bare `SHD(true_dag, learned_dag)` call). It would need a rewrite regardless of this proposal. [CausalEval#13](https://github.com/pgmpy/CausalEval/issues/13), opened by @ankurankan, asks for exactly this capability: "a benchmark suite ... to test how well these methods can recover the true graph," and is still open.
 
 CausalEval already solves a structurally similar problem for CI tests: `ci_benchmarks/` (`DGM.py` + `ci_benchmark.py`) sweeps data-generating mechanisms against CI tests via a hand-written dict registry (`DGP_REGISTRY`, `DGM_TO_CITESTS`) and fully sequential nested `for` loops, writing raw + summary CSVs consumed by `pgmpy.org/causalbench`. It predates the tag/`skbase`-object model that `datasets`, `metrics`, and `causal_discovery` have since converged on, and it doesn't parallelize.
 
-This proposal is for `CausalDiscoveryBenchmark`: given a set of causal discovery estimators, a set of datasets/simulators, a set of metrics, and a set of sample sizes, run every applicable combination, evaluate the requested metrics, and return one tidy results table — parallelized across CPU cores by default, and across a cluster without any cluster-specific code in pgmpy or CausalEval.
+This proposal is for `CausalDiscoveryBenchmark`: given a set of causal discovery estimators, datasets or simulators, metrics, and sample sizes, run every applicable combination, evaluate the requested metrics, and return one tidy results table. The first implementation uses local CPU parallelism through `joblib` and can write that table to CSV for the existing CausalEval workflow.
 
 **Non-goals.** This proposal does not add new causal discovery algorithms, new datasets, or new metrics — it composes the ones that already exist (and the ones sibling proposals in this repo are adding). It also does not cover publishing results to `pgmpy.org/causalbench` (CausalEval's existing `web/` dashboard) — that's a natural follow-up, noted under Open Questions, but kept out of scope here so this proposal stays focused on the benchmarking class itself.
 
@@ -18,8 +18,9 @@ This proposal is for `CausalDiscoveryBenchmark`: given a set of causal discovery
 
 * One declarative entry point that sweeps `estimators × datasets × n_samples`, evaluates the requested metrics on each fitted result, and returns a single results table.
 * Reuse pgmpy's existing primitives end-to-end — `BaseCausalDiscovery.fit`, `pgmpy.metrics.get_metrics`, `load_dataset`/`list_datasets` — rather than re-implementing fitting, scoring, or dataset-loading logic.
-* Parallel by default on a single machine; scalable to a cluster without adding a hard dependency on a specific distributed-computing framework.
+* Parallel fitting on a single machine through `joblib`, without changing the estimators' public APIs.
 * Tolerant of partial failure: one incompatible or crashing (estimator, dataset, metric) combination shouldn't abort the rest of the sweep.
+* Produce a stable CSV export in addition to the in-memory results table, so downstream reporting and the existing CausalEval frontend can consume the same result format.
 * Lands in `CausalEval`, alongside the existing `ci_benchmarks/`.
 
 ### References
@@ -33,36 +34,38 @@ This proposal is for `CausalDiscoveryBenchmark`: given a set of causal discovery
 
 ### Proposed Solution
 
-`CausalDiscoveryBenchmark` is configured once (estimators, datasets, metrics, sample sizes, and a few execution options) and run with `.run()`, which populates `.results_` — a long/tidy `DataFrame` with one row per `(dataset, n_samples, estimator, metric)` combination. A `.summary()` method pivots this into the wide `estimator × dataset` view sketched in the original guidance, with one column per metric.
+`CausalDiscoveryBenchmark` is configured once (estimators, datasets, metrics, sample sizes, and a few execution options) and run with `.run()`, which populates `.results_`. It is a long/tidy `DataFrame`: each scalar metric result has one row per `(dataset, n_samples, estimator, metric, component)` combination. Scalar metrics use `component="value"`; dictionary-valued metrics contribute one row for each returned key. A `.summary()` method pivots this into the wide `estimator × dataset` view, and `.to_csv()` writes the raw long-format result table.
 
-The unit of parallel work is one `(dataset, n_samples, estimator)` triple: load/simulate the data once, call `.fit()` once, then evaluate *every* requested metric against that single fit (metric evaluation is cheap relative to structure search, so there's no reason to refit per metric). Which metrics apply to a given dataset is resolved automatically from tags already on the metric classes and the dataset:
+For each `(dataset, n_samples)` pair, data is resolved once in the main process so every estimator sees the same draw. The resulting estimator tasks run in parallel. A task clones its estimator before fitting, which avoids fitted state leaking across tasks and keeps the design safe with either process or thread backends. When the outer benchmark is parallel, estimators that expose `n_jobs` run with `n_jobs=1` inside a task to avoid nested parallelism.
 
-* A metric with `requires_true_graph=True` (e.g. `SHD`) only runs if the dataset has `has_ground_truth=True`, or the caller supplied an explicit override via `ground_truth={label: dag, ...}`.
-* A metric with `requires_data=True` (e.g. `StructureScore`) always runs, since it doesn't need ground truth — it scores the fitted graph against held-out data.
-* If `train_test_split` is set, the estimator fits on the training split and `requires_data=True` metrics are evaluated against the held-out split; `requires_true_graph=True` metrics are unaffected, since they compare graphs, not data.
+Each task fits once and evaluates every requested metric against that one fitted graph. Which metrics apply is resolved from metric tags and the fitted graph:
 
-Combinations that don't apply (e.g. an `SHD` request against a dataset with no ground truth and no override) are dropped up front with a logged warning rather than silently producing `NaN`s or raising mid-sweep.
+* A metric with `requires_true_graph=True` (e.g. `SHD`) only runs if a ground-truth graph is available, either from the dataset or through `ground_truth={label: dag, ...}`.
+* A metric must support the fitted graph's type. For example, `StructureScore` supports `DAG`, while `PC` and `GES` return `PDAG` by default; a benchmark requiring `StructureScore` must request `return_type="dag"` for those estimators.
+* If `train_test_split` is set, the estimator fits on the training split and `requires_data=True` metrics receive the held-out split. `requires_true_graph=True` metrics are unaffected because they compare graphs rather than data.
 
-For execution, tasks are dispatched with `joblib.Parallel` — already a hard dependency of pgmpy, and already used the same way elsewhere in the codebase (`_TreeSearchMixin._get_weights`). This gets multi-core execution for free with `n_jobs`, and cluster execution for free too: joblib supports pluggable backends, so wrapping the call in `with joblib.parallel_config(backend="dask"): benchmark.run()` (after connecting a `dask.distributed.Client`) or `backend="ray"` (after `ray.util.joblib.register_ray()`) routes the exact same tasks to a cluster, with zero cluster-specific code in this proposal. Each task catches its own exceptions, so a single estimator crashing or timing out on one dataset shows up as a `status`/`error` cell rather than killing the run.
+Metrics that do not apply are recorded as `status="skipped"` rows with a reason. A failure while fitting is recorded once for that estimator task; a failure in one metric is recorded only for that metric and does not prevent the remaining metrics from being evaluated.
+
+For execution, estimator tasks are dispatched with `joblib.Parallel`, which is already a dependency of pgmpy. The initial scope is local execution through `n_jobs`; distributed backends remain a possible extension once the result schema and task boundaries are proven locally.
 
 This lives in `CausalEval` as `cd_benchmarks/`, a sibling to `ci_benchmarks/`, rather than in pgmpy core — it composes public pgmpy APIs and doesn't need to live inside the library itself, matching where the analogous CI-test benchmarking already lives.
 
 ### Alternative Solutions
 
 **A. Results table shape: long, wide, or both?**
-The two shapes sketched in the original guidance are actually two different things: a single-metric long table (`dataset, estimator, metric`) and a multi-metric wide table (`Algo, Dataset, M1, M2, M3`). Rather than pick one, `.results_` is long/tidy (one row per metric — easiest to `groupby`/filter/plot, and the natural shape when metrics don't all apply to every dataset) and `.summary()` derives the wide pivot on demand. This also matches `ci_benchmarks`' existing raw-CSV-plus-summary-CSV convention, so it isn't a new pattern for the repo.
+The two shapes sketched in the original guidance are actually two different things: a single-metric long table (`dataset, estimator, metric`) and a multi-metric wide table (`Algo, Dataset, M1, M2, M3`). Rather than pick one, `.results_` is long/tidy (one row per metric component — easiest to `groupby`/filter/plot, and the natural shape when metrics do not all apply to every dataset) and `.summary()` derives the wide pivot on demand. This also matches `ci_benchmarks`' existing raw-CSV-plus-summary-CSV convention, so it is not a new pattern for the repo.
 
-**B. Hard dependency on Dask/Ray vs. joblib's pluggable backend.**
-Considered adding `dask.distributed` or `ray` directly and branching on an explicit `backend=` argument. Rejected: it forces a choice of cluster framework onto everyone who installs CausalEval, even those who only ever run locally, and pgmpy already has a working precedent (`_TreeSearchMixin`) for joblib-only parallelism. Depending only on `joblib.Parallel` and letting users bring their own joblib-compatible backend (`loky` locally by default, `dask`/`ray` for a cluster, both of which register themselves as joblib backends) gets cluster scaling without CausalEval ever importing a distributed-computing library itself.
+**B. Distributed backends in the first implementation.**
+Considered documenting Dask and Ray through joblib's pluggable backend immediately. Rejected for the initial implementation: local execution is enough to settle task serialization, resource use, and error handling. A later extension can document an optional joblib-compatible backend without making Dask or Ray a dependency of CausalEval.
 
 **C. Fail-fast vs. per-task error capture.**
-A sweep this size will occasionally hit a combination that doesn't make sense (an `SHD` request with no ground truth anywhere) or one that crashes at runtime (a solver that diverges on a particular sample). Failing the entire `.run()` for one bad cell is unfriendly for something meant to run tens or hundreds of combinations unattended. Chosen approach: validate structurally invalid configuration eagerly, before any task starts (e.g. an `estimators` entry that isn't a `BaseCausalDiscovery`, a dataset string `list_datasets()` doesn't recognize) — that should fail loudly and immediately — but catch exceptions *within* each dispatched task and record them in a `status` column, so a single flaky combination doesn't take down a multi-hour run.
+A sweep can contain a structurally invalid configuration (for example, an unknown dataset name) or a valid combination that fails only at runtime. The former should fail before tasks start. The latter should be captured in the affected result row, with an exception type and message. Metric evaluation is isolated further: one unsupported or failing metric must not discard the other metric values for the same fitted graph.
 
 **D. Should `CausalDiscoveryBenchmark` itself subclass `BaseEstimator`/`BaseObject`?**
 `BaseCausalDiscovery` subclasses sklearn's `BaseEstimator`; `BaseDataset`/`BaseSupervisedMetric`/`BaseUnsupervisedMetric` subclass `skbase.base.BaseObject`. Both exist so those components are *discoverable and swappable* (via `get_metrics()`/`all_objects()`-style registry lookups and `get_params()`/`set_params()`/tags). `CausalDiscoveryBenchmark` isn't itself a pluggable component — nothing needs to look it up by tag or clone it — so it's a plain class. It does still benefit from the same `repr()` convention (see Details), just without inheriting anything to get it.
 
 **E. Scalar-only metrics vs. handling structured metric values.**
-Not every metric in `pgmpy.metrics` returns a single number — `AdjacencyConfusionMatrix.evaluate()` returns a `Dict[str, float]` (precision, recall, F1, ...), not a scalar. Assuming scalars-only would either break on that metric or require a separate code path for it. Instead, `_run_one_task` flattens dict-valued metric results into one column per key (`AdjacencyConfusionMatrix.precision`, `AdjacencyConfusionMatrix.recall`, ...), so the wide `.summary()` table stays fully tabular regardless of which metrics are requested.
+Not every metric in `pgmpy.metrics` returns a single number — `AdjacencyConfusionMatrix.evaluate()` returns a dictionary of values such as precision, recall, and F1. The runner stores these as separate long-format rows with the same metric name and different `component` values. `.summary()` then creates a column for each `metric.component` pair.
 
 ### Details of proposed solution
 
@@ -78,10 +81,10 @@ CausalEval/
         _base.py                   # CausalDiscoveryBenchmark, task resolution + execution
 ```
 
-**Resolving datasets.** `datasets` accepts a string name (resolved through the existing `load_dataset` registry) or an already-constructed `BaseSimulatedDataset` instance (e.g. `AdditiveNoiseModel(n_nodes=10, edge_prob=0.3)`), which matters because some simulator configuration — a custom noise distribution, a fixed DAG — can't always be round-tripped through a string-plus-kwargs call. The label for a string is the name itself; the label for an instance is its `repr()`, which both `BaseDataset` (via `skbase.base.BaseObject`) and `BaseCausalDiscovery` (via sklearn's `BaseEstimator`) already produce for free, showing only non-default constructor arguments — I checked this empirically against `skbase.base.BaseObject` and it matches sklearn's behavior exactly (e.g. `AdditiveNoiseModel(n_nodes=10)`, not every default field). That's also exactly the format the original guidance's example table already assumed (`PC(ci_test='chi_square')`), so no separate labeling scheme is needed for estimators either.
+**Resolving datasets.** `datasets` accepts a string name (resolved through the existing `load_dataset` registry) or an already-constructed `BaseSimulatedDataset` instance (e.g. `AdditiveNoiseModel(n_nodes=10, edge_prob=0.3)`). The latter is useful when configuration contains objects that cannot be represented as keyword arguments, such as a custom noise distribution or a fixed DAG. A string dataset uses the benchmark's `seed`; an initialized simulator owns its seed through its constructor. The label for a string is its name and the label for an instance is its `repr()`.
 
 ```python
-from pgmpy.datasets import load_dataset, list_datasets, BaseDataset
+from pgmpy.datasets import load_dataset, list_datasets
 from pgmpy.datasets._base import BaseSimulatedDataset, Dataset
 
 def _resolve_dataset(dataset, n_samples, seed) -> tuple[str, Dataset]:
@@ -107,72 +110,115 @@ def _resolve_dataset(dataset, n_samples, seed) -> tuple[str, Dataset]:
     )
 ```
 
-**Resolving metrics.** Accepts metric classes (`SHD`) or instances (`SHD(edge_reverse_penalty=2)`) — classes are instantiated with defaults. Applicability is read straight off each metric's own tags (`requires_true_graph`) rather than an `isinstance(metric, BaseSupervisedMetric)` check — the two are equivalent for pgmpy's built-in metrics, but tags also work for a metric that mixes both behaviors, and match how `BaseCausalDiscovery.score()` already resolves metrics internally:
+**Resolving metrics.** The benchmark accepts metric classes (`SHD`) or instances (`SHD(edge_reverse_penalty=2)`); classes are instantiated with defaults. Inputs are validated as pgmpy metric objects. Applicability is read from each metric's `requires_true_graph`, `requires_data`, and `supported_graph_types` tags.
 
 ```python
-def _resolve_metrics(metrics):
-    return [m() if isinstance(m, type) else m for m in metrics]
+from pgmpy.metrics import BaseSupervisedMetric, BaseUnsupervisedMetric
 
-def _applicable_metrics(metrics, has_ground_truth: bool):
-    applicable, skipped = [], []
-    for metric in metrics:
-        needs_truth = metric.get_tag("requires_true_graph", False, raise_error=False)
-        if needs_truth and not has_ground_truth:
-            name = metric.get_tag("name", repr(metric), raise_error=False)
-            skipped.append((name, "no ground truth available"))
-        else:
-            applicable.append(metric)
-    return applicable, skipped
+def _resolve_metrics(metrics):
+    resolved = [metric() if isinstance(metric, type) else metric for metric in metrics]
+    if not all(isinstance(metric, (BaseSupervisedMetric, BaseUnsupervisedMetric)) for metric in resolved):
+        raise TypeError("metrics must contain pgmpy metric classes or instances")
+    return resolved
 ```
 
-**Running one task.** Fits once, times it, evaluates every applicable metric against that one fit, flattens dict-valued results, and never lets an exception escape:
+**Running one task.** A task clones and fits one estimator, then evaluates each metric separately. It returns a list of long-format rows. It passes the learned graph directly to metrics rather than reconstructing one from its edges, preserving isolated nodes. This keeps estimator state local to the task, avoids nested parallelism, and lets one metric fail without hiding the other results:
 
 ```python
 import time
+from sklearn.base import clone
 from sklearn.model_selection import train_test_split as sk_train_test_split
 
-def _run_one_task(dataset_label, dataset, n_samples, estimator, metrics, train_test_split, seed):
-    row = {
+def _run_one_task(dataset_label, dataset, n_samples, estimator, metrics, train_test_split, seed, outer_n_jobs):
+    base_row = {
         "dataset": dataset_label,
         "n_samples": n_samples,
         "n_samples_actual": dataset.data.shape[0],
         "estimator": repr(estimator),
-        "status": "ok",
     }
     try:
-        has_gt = dataset.ground_truth is not None
-        applicable, skipped = _applicable_metrics(metrics, has_gt)
-        for name, reason in skipped:
-            row[name] = None  # metric not applicable to this dataset; see `status`
-        if skipped:
-            row["status"] = f"skipped {len(skipped)} metric(s): " + "; ".join(
-                f"{n} ({r})" for n, r in skipped
-            )
-
         train_df, test_df = dataset.data, dataset.data
         if train_test_split is not None:
             train_df, test_df = sk_train_test_split(
                 dataset.data, train_size=train_test_split, random_state=seed
             )
 
+        fitted = clone(estimator)
+        if outer_n_jobs != 1 and "n_jobs" in fitted.get_params(deep=False):
+            fitted.set_params(n_jobs=1)
         start = time.perf_counter()
-        fitted = estimator.fit(train_df)
-        row["runtime_sec"] = time.perf_counter() - start
+        fitted.fit(train_df)
+        runtime_sec = time.perf_counter() - start
+    except Exception as exc:
+        return [
+            {
+                **base_row,
+                "metric": None,
+                "component": None,
+                "value": None,
+                "runtime_sec": None,
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        ]
 
-        for metric in applicable:
-            name = metric.get_tag("name", repr(metric), raise_error=False)
-            if metric.get_tag("requires_true_graph", False, raise_error=False):
+    rows = []
+    for metric in metrics:
+        name = metric.get_tag("name", repr(metric), raise_error=False)
+        metric_row = {**base_row, "metric": name, "runtime_sec": runtime_sec}
+        needs_truth = metric.get_tag("requires_true_graph", False, raise_error=False)
+        supported_types = metric.get_tag("supported_graph_types", (), raise_error=False)
+        if needs_truth and dataset.ground_truth is None:
+            rows.append(
+                {
+                    **metric_row,
+                    "component": None,
+                    "value": None,
+                    "status": "skipped",
+                    "error": "no ground truth",
+                }
+            )
+            continue
+        if not isinstance(fitted.causal_graph_, supported_types):
+            rows.append(
+                {
+                    **metric_row,
+                    "component": None,
+                    "value": None,
+                    "status": "skipped",
+                    "error": "unsupported graph type",
+                }
+            )
+            continue
+        try:
+            if needs_truth:
                 value = metric.evaluate(true_causal_graph=dataset.ground_truth, est_causal_graph=fitted.causal_graph_)
             else:
                 value = metric.evaluate(X=test_df, causal_graph=fitted.causal_graph_)
-            if isinstance(value, dict):
-                for k, v in value.items():
-                    row[f"{name}.{k}"] = v
-            else:
-                row[name] = value
-    except Exception as exc:  # one bad combination must not sink the whole sweep
-        row["status"] = f"error: {exc}"
-    return row
+            values = value.items() if isinstance(value, dict) else [("value", value)]
+            rows.extend(
+                {
+                    **metric_row,
+                    "component": key,
+                    "value": val,
+                    "status": "ok",
+                    "error": None,
+                }
+                for key, val in values
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    **metric_row,
+                    "component": None,
+                    "value": None,
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+    return rows
 ```
 
 **The `CausalDiscoveryBenchmark` class itself:**
@@ -180,6 +226,7 @@ def _run_one_task(dataset_label, dataset, n_samples, estimator, metrics, train_t
 ```python
 import pandas as pd
 from joblib import Parallel, delayed
+from pgmpy.causal_discovery._base import BaseCausalDiscovery
 
 class CausalDiscoveryBenchmark:
     def __init__(
@@ -194,6 +241,8 @@ class CausalDiscoveryBenchmark:
         n_jobs: int = -1,
         show_progress: bool = True,
     ):
+        if not all(isinstance(estimator, BaseCausalDiscovery) for estimator in estimators):
+            raise TypeError("estimators must contain BaseCausalDiscovery instances")
         self.estimators = estimators
         self.datasets = datasets
         self.metrics = _resolve_metrics(metrics)
@@ -217,27 +266,32 @@ class CausalDiscoveryBenchmark:
                 for estimator in self.estimators:
                     tasks.append((label, dataset, n, estimator))
 
-        rows = Parallel(n_jobs=n_jobs, verbose=10 if show_progress else 0)(
+        task_rows = Parallel(n_jobs=n_jobs, verbose=10 if show_progress else 0)(
             delayed(_run_one_task)(
-                label, dataset, n, estimator, self.metrics, self.train_test_split, self.seed
+                label, dataset, n, estimator, self.metrics, self.train_test_split, self.seed, n_jobs
             )
             for label, dataset, n, estimator in tasks
         )
-        self.results_ = pd.DataFrame(rows)
+        self.results_ = pd.DataFrame([row for rows in task_rows for row in rows])
         return self
 
     def summary(self) -> pd.DataFrame:
-        """Wide estimator x dataset view, one column per metric (the Algo/Dataset/M1/M2/M3 shape)."""
-        value_cols = [
-            c for c in self.results_.columns
-            if c not in {"dataset", "n_samples", "n_samples_actual", "estimator", "status", "runtime_sec"}
-        ]
-        return self.results_.pivot_table(
-            index=["estimator", "dataset", "n_samples"], values=value_cols, aggfunc="first"
+        """Return a wide estimator-by-dataset view of successful metric values."""
+        successful = self.results_.query("status == 'ok'").copy()
+        successful["metric_component"] = successful["metric"] + "." + successful["component"]
+        return successful.pivot_table(
+            index=["estimator", "dataset", "n_samples"],
+            columns="metric_component",
+            values="value",
+            aggfunc="first",
         ).reset_index()
+
+    def to_csv(self, path, **kwargs):
+        """Write the raw long-format benchmark results to CSV."""
+        self.results_.to_csv(path, index=False, **kwargs)
 ```
 
-*(Imports shown next to the code they support, for readability here; in the actual module they'd be collected at the top of `cd_benchmarks/_base.py`. `BaseCausalDiscovery` and `BaseSimulatedDataset` aren't currently exported from their packages' `__init__.py` `__all__` — I imported them from `pgmpy.causal_discovery._base` / `pgmpy.datasets._base` directly above and checked that this resolves correctly against current `dev`. The same is true one level down: concrete simulators like `AdditiveNoiseModel`/`LinearGaussianSCM` aren't re-exported from `pgmpy.datasets` either, only from their own submodules — fine when going through `load_dataset("anm")`, but it's the exact "initialized dataset object" path this proposal needs, so it's worth exporting alongside `BaseCausalDiscovery`/`BaseSimulatedDataset`. All three are one-line, separate fixes worth raising regardless of this proposal.)*
+*(Imports are shown next to the code they support for readability. The implementation would collect them at the top of `cd_benchmarks/_base.py`.)*
 
 **Results schema** (`.results_`, long format):
 
@@ -247,33 +301,29 @@ class CausalDiscoveryBenchmark:
 | `n_samples` | the requested sweep value (grouping key; use this for e.g. a metric-vs-n_samples plot) |
 | `n_samples_actual` | rows actually loaded — differs from `n_samples` only when a static dataset is smaller than requested (existing `load_dataset` warn-and-cap behavior) |
 | `estimator` | `repr()` of the estimator instance |
-| `runtime_sec` | wall-clock time for `.fit()` |
-| `<metric name>` | one column per scalar metric; dict-valued metrics get `<metric name>.<key>` instead |
-| `status` | `"ok"`, `"skipped ..."` (metric inapplicable to this dataset), or `"error: ..."` (caught exception) |
-
-**Cluster execution** requires no code change — only a context around `.run()`:
-
-```python
-from dask.distributed import Client
-import joblib
-
-client = Client("scheduler-address:8786")
-with joblib.parallel_config(backend="dask"):
-    benchmark.run()
-```
+| `metric` | metric tag name, such as `SHD` or `adjacency_confusion_matrix` |
+| `component` | `value` for scalar metrics, or a dictionary key such as `precision` |
+| `value` | scalar result value |
+| `runtime_sec` | wall-clock time for fitting the estimator |
+| `status` | `"ok"`, `"skipped"`, or `"error"` |
+| `error_type` | exception class when the status is `"error"` |
+| `error` | skip reason or exception message when the status is not `"ok"` |
 
 ### User journeys with the solution
 
-**1. The original sketch, with the real PC parameter name** (the guidance's example uses `max_cond_set`, which doesn't exist on `PC` — the actual keyword is `max_cond_vars`):
+**1. Comparing algorithms on a simulated linear Gaussian dataset:**
 
 ```python
-from pgmpy.causal_discovery import PC
-from pgmpy.datasets.anm import AdditiveNoiseModel  # not yet re-exported from pgmpy.datasets, see note below
+from pgmpy.causal_discovery import GES, PC
+from pgmpy.datasets.linear_gaussian_scm import LinearGaussianSCM
 from pgmpy.metrics import SHD
 
 benchmark = CausalDiscoveryBenchmark(
-    estimators=[PC(max_cond_vars=5, ci_test="chi_square"), PC(ci_test="pillai")],
-    datasets=["hitters", AdditiveNoiseModel()],
+    estimators=[
+        PC(ci_test="pearsonr", return_type="dag", max_cond_vars=5),
+        GES(scoring_method="bic-g", return_type="dag"),
+    ],
+    datasets=[LinearGaussianSCM(n_nodes=10, edge_prob=0.3, seed=42)],
     metrics=[SHD],
 ).run()
 benchmark.summary()
@@ -283,7 +333,10 @@ benchmark.summary()
 
 ```python
 CausalDiscoveryBenchmark(
-    estimators=[PC(ci_test="chi_square"), GES()],
+    estimators=[
+        PC(ci_test="pearsonr", return_type="dag"),
+        GES(scoring_method="bic-g", return_type="dag"),
+    ],
     datasets=[LinearGaussianSCM(n_nodes=10, edge_prob=0.3)],
     metrics=[SHD, StructureScore],
     n_samples=[200, 500, 1000, 5000],
@@ -294,7 +347,7 @@ CausalDiscoveryBenchmark(
 
 ```python
 CausalDiscoveryBenchmark(
-    estimators=[PC(), GES()],
+    estimators=[PC(ci_test="pearsonr", return_type="dag"), GES(return_type="dag")],
     datasets=["some_real_dataset_without_dagitty_ground_truth"],
     metrics=[SHD],
     ground_truth={"some_real_dataset_without_dagitty_ground_truth": my_known_dag},
@@ -305,33 +358,38 @@ CausalDiscoveryBenchmark(
 
 ```python
 CausalDiscoveryBenchmark(
-    estimators=[PC(), HillClimbSearch()],
-    datasets=["hitters"],
+    estimators=[PC(ci_test="pearsonr", return_type="dag"), HillClimbSearch(scoring_method="bic-g")],
+    datasets=[LinearGaussianSCM(n_nodes=8, edge_prob=0.3, seed=42)],
     metrics=[StructureScore],
     train_test_split=0.7,
 ).run()
 ```
 
-**5. Reading off a partial failure** — one combination that had no ground truth, alongside one that ran cleanly:
+**5. Reading off a skipped metric** — one dataset has no ground truth while another runs cleanly:
 
 ```python
->>> benchmark.results_[["dataset", "estimator", "status"]]
-     dataset               estimator                  status
-0    hitters               PC(ci_test='chi_square')    ok
-1    some_dataset_no_gt    PC(ci_test='chi_square')    skipped 1 metric(s): SHD (no ground truth available)
+>>> benchmark.results_[["dataset", "metric", "status", "error"]]
+     dataset               metric  status    error
+0    LinearGaussianSCM(...) SHD    ok        None
+1    some_dataset_no_gt    SHD     skipped   no ground truth
 ```
 
-**6. Same sweep, run on a Dask cluster** instead of local cores — identical benchmark definition, only the execution context changes (shown above under Cluster execution).
+**6. Persisting raw benchmark results:**
+
+```python
+benchmark.to_csv("results/linear_gaussian.csv")
+```
 
 ### Open Questions
 
-* **Repeats across stochastic simulators.** A single draw from a simulator is noisy; averaging over several seeds per `(dataset, estimator, n_samples)` cell would make comparisons more reliable, similar to `ci_benchmarks`' existing `n_repeats`. Left out of this proposal to keep it focused on the core sweep-and-collect mechanics; a natural `n_repeats` follow-up.
+* **Repeats across stochastic simulators.** A single draw from a simulator is noisy; averaging over several seeds per `(dataset, estimator, n_samples)` cell would make comparisons more reliable, similar to `ci_benchmarks`' existing `n_repeats`. Phase 1 uses the benchmark `seed` for string dataset generation and train/test splitting; initialized simulators and stochastic estimator settings remain explicit user configuration. A future `n_repeats` API should define a per-task seed schedule.
 * **Per-task timeouts.** Some estimator/dataset combinations may hang rather than error (e.g. an exhaustive search on a large graph). Not addressed here.
-* **Publishing to `pgmpy.org/causalbench`.** `ci_benchmarks` already has a CSV output + `web/` dashboard convention; wiring `.results_`/`.summary()` into that pipeline is a reasonable follow-up once the core class is settled.
+* **Distributed execution.** Dask or Ray can be considered after local execution is tested. They should remain optional joblib-compatible backends rather than dependencies of CausalEval.
+* **Publishing to `pgmpy.org/causalbench`.** The runner writes a stable CSV in Phase 1. Wiring that output into the `web/` dashboard remains a separate follow-up.
 * **Module name.** `cd_benchmarks` mirrors the existing `ci_benchmarks` naming, but `causal_discovery_benchmarks` is more explicit — open to either.
 
 ### Rollout plan
 
-* **Phase 1:** `CausalDiscoveryBenchmark` core — dataset/metric/estimator resolution, `joblib`-parallel `_run_one_task` execution, long-format `results_`, single-machine only. Tests against `PC`/`GES` on `LinearGaussianSCM`/`AdditiveNoiseModel`.
-* **Phase 2:** `.summary()` wide pivot, `train_test_split`, `ground_truth` override, dict-valued metric flattening.
-* **Phase 3:** Documented cluster example (Dask), and CSV/dashboard integration matching `ci_benchmarks`' existing output convention.
+* **Phase 1:** `CausalDiscoveryBenchmark` core — input validation, dataset resolution, cloned local `joblib` tasks, `train_test_split`, ground-truth overrides, long-format `results_`, `.summary()`, and `.to_csv()`. Tests cover scalar and dictionary metrics, missing ground truth, unsupported graph types, metric-level errors, isolated nodes, and static versus simulated datasets.
+* **Phase 2:** Repeated runs with an explicit seed schedule and per-task timeouts.
+* **Phase 3:** Optional distributed-backend documentation and dashboard integration using the CSV output convention already used by `ci_benchmarks`.
