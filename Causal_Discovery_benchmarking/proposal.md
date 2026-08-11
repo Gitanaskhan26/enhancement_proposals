@@ -34,17 +34,17 @@ This proposal is for `CausalDiscoveryBenchmark`: given a set of causal discovery
 
 ### Proposed Solution
 
-`CausalDiscoveryBenchmark` is configured once (estimators, datasets, metrics, sample sizes, and a few execution options) and run with `.run()`, which populates `.results_`. It is a long/tidy `DataFrame`: each scalar metric result has one row per `(dataset, n_samples, estimator, metric, component)` combination. Scalar metrics use `component="value"`; dictionary-valued metrics contribute one row for each returned key. A `.summary()` method pivots this into the wide `estimator × dataset` view, and `.to_csv()` writes the raw long-format result table.
+`CausalDiscoveryBenchmark` is configured once (estimators, datasets, metrics, sample sizes, and a few execution options) and run with `.run()`, which populates `.results_`. It is a long/tidy `DataFrame`: each scalar metric result has one row per `(dataset, n_samples, repeat_idx, estimator, metric, component)` combination. Scalar metrics use `component="value"`; dictionary-valued metrics contribute one row for each returned key. A `.summary()` method pivots this into the wide `estimator × dataset` view (averaging across repeats), and `.to_csv()` writes the raw long-format result table.
 
-For each `(dataset, n_samples)` pair, data is resolved once in the main process so every estimator sees the same draw. The resulting estimator tasks run in parallel. A task clones its estimator before fitting, which avoids fitted state leaking across tasks and keeps the design safe with either process or thread backends. When the outer benchmark is parallel, estimators that expose `n_jobs` run with `n_jobs=1` inside a task to avoid nested parallelism.
+For each `(dataset, n_samples, repeat_idx)` triple, data is resolved once in the main process so every estimator sees the same draw. The resulting estimator tasks run in parallel. A task clones its estimator before fitting, which avoids fitted state leaking across tasks and keeps the design safe with either process or thread backends. When the outer benchmark is parallel, estimators that expose `n_jobs` run with `n_jobs=1` inside a task to avoid nested parallelism.
 
-Each task fits once and evaluates every requested metric against that one fitted graph. Which metrics apply is resolved from metric tags and the fitted graph:
+Each task fits once and evaluates every requested metric against that one fitted graph:
 
-* A metric with `requires_true_graph=True` (e.g. `SHD`) only runs if a ground-truth graph is available, either from the dataset or through `ground_truth={label: dag, ...}`.
-* A metric must support the fitted graph's type. For example, `StructureScore` supports `DAG`, while `PC` and `GES` return `PDAG` by default; a benchmark requiring `StructureScore` must request `return_type="dag"` for those estimators.
+* A metric with `requires_true_graph=True` (e.g. `SHD`) that receives no ground truth will raise an error, recorded in the result row with `status="error"`. The user is responsible for supplying ground truth (via the dataset or `ground_truth={...}`) for any metric that requires it.
+* A metric must support the fitted graph's type. For example, `StructureScore` supports `DAG`, while `PC` and `GES` return `PDAG` by default; a benchmark requiring `StructureScore` must request `return_type="dag"` for those estimators. A type mismatch is recorded as `status="error"`.
 * If `train_test_split` is set, the estimator fits on the training split and `requires_data=True` metrics receive the held-out split. `requires_true_graph=True` metrics are unaffected because they compare graphs rather than data.
 
-Metrics that do not apply are recorded as `status="skipped"` rows with a reason. A failure while fitting is recorded once for that estimator task; a failure in one metric is recorded only for that metric and does not prevent the remaining metrics from being evaluated.
+A failure while fitting is recorded once for that estimator task; a failure in one metric is recorded only for that metric and does not prevent the remaining metrics from being evaluated. There is no `"skipped"` status — every requested combination either produces a value (`"ok"`) or an error (`"error"`).
 
 For execution, estimator tasks are dispatched with `joblib.Parallel`, which is already a dependency of pgmpy. The initial scope is local execution through `n_jobs`; distributed backends remain a possible extension once the result schema and task boundaries are proven locally.
 
@@ -81,18 +81,22 @@ CausalEval/
         _base.py                   # CausalDiscoveryBenchmark, task resolution + execution
 ```
 
-**Resolving datasets.** `datasets` accepts a string name (resolved through the existing `load_dataset` registry) or an already-constructed `BaseSimulatedDataset` instance (e.g. `AdditiveNoiseModel(n_nodes=10, edge_prob=0.3)`). The latter is useful when configuration contains objects that cannot be represented as keyword arguments, such as a custom noise distribution or a fixed DAG. A string dataset uses the benchmark's `seed`; an initialized simulator owns its seed through its constructor. The label for a string is its name and the label for an instance is its `repr()`.
+**Resolving datasets.** `datasets` accepts a string name (resolved through the existing `load_dataset` registry) or an already-constructed `BaseSimulatedDataset` instance (e.g. `AdditiveNoiseModel(n_nodes=10, edge_prob=0.3)`). The label for a string is its name and the label for an instance is its `repr()`.
+
+For string datasets, each `(dataset, n_samples, repeat_idx)` combination receives its own `data_seed` from the benchmark's seed schedule. This seed is passed to `load_dataset(..., seed=data_seed)`, so every repeat draws an independent sample from the same data-generating process.
+
+For initialized `BaseSimulatedDataset` instances, the simulator owns its own seed through its constructor. The benchmark calls `load_dataframe(n_samples=n_samples)` on the same object for every repeat. Whether this produces independent samples depends on the simulator's internal state. **Phase 1 does not inject the benchmark's `data_seed` into initialized simulators.** For reliable repeated sampling, use a registered dataset name (string) rather than a pre-constructed instance. Extending the simulator contract to accept an external seed for per-repeat variation is noted as a Phase 2 item.
 
 ```python
 from pgmpy.datasets import load_dataset, list_datasets
 from pgmpy.datasets._base import BaseSimulatedDataset, Dataset
 
-def _resolve_dataset(dataset, n_samples, seed) -> tuple[str, Dataset]:
+def _resolve_dataset(dataset, n_samples, data_seed) -> tuple[str, Dataset]:
     """Load one (dataset, n_samples) combination, returning a (label, Dataset) pair."""
     if isinstance(dataset, str):
         if dataset not in list_datasets():
             raise ValueError(f"Unknown dataset name: {dataset!r}")
-        return dataset, load_dataset(dataset, n_samples=n_samples, seed=seed)
+        return dataset, load_dataset(dataset, n_samples=n_samples, seed=data_seed)
 
     if isinstance(dataset, BaseSimulatedDataset):
         df = dataset.load_dataframe(n_samples=n_samples)
@@ -110,42 +114,72 @@ def _resolve_dataset(dataset, n_samples, seed) -> tuple[str, Dataset]:
     )
 ```
 
-**Resolving metrics.** The benchmark accepts metric classes (`SHD`) or instances (`SHD(edge_reverse_penalty=2)`); classes are instantiated with defaults. Inputs are validated as pgmpy metric objects. Applicability is read from each metric's `requires_true_graph`, `requires_data`, and `supported_graph_types` tags.
+**Resolving metrics.** The benchmark accepts metric instances only (e.g. `SHD()`, `SHD(edge_reverse_penalty=2)`). Passing an uninstantiated class raises a `TypeError`. Applicability is read from each metric's `requires_true_graph`, `requires_data`, and `supported_graph_types` tags.
 
 ```python
 from pgmpy.metrics import BaseSupervisedMetric, BaseUnsupervisedMetric
 
 def _resolve_metrics(metrics):
-    resolved = [metric() if isinstance(metric, type) else metric for metric in metrics]
-    if not all(isinstance(metric, (BaseSupervisedMetric, BaseUnsupervisedMetric)) for metric in resolved):
-        raise TypeError("metrics must contain pgmpy metric classes or instances")
-    return resolved
+    for metric in metrics:
+        if isinstance(metric, type):
+            raise TypeError(
+                f"metrics must contain metric instances, not classes. "
+                f"Use {metric.__name__}() instead of {metric.__name__}."
+            )
+    if not all(isinstance(metric, (BaseSupervisedMetric, BaseUnsupervisedMetric)) for metric in metrics):
+        raise TypeError("metrics must contain BaseSupervisedMetric or BaseUnsupervisedMetric instances")
+    return list(metrics)
 ```
 
-**Running one task.** A task clones and fits one estimator, then evaluates each metric separately. It returns a list of long-format rows. It passes the learned graph directly to metrics rather than reconstructing one from its edges, preserving isolated nodes. This keeps estimator state local to the task, avoids nested parallelism, and lets one metric fail without hiding the other results:
+**Seed propagation.** The benchmark's `seed` drives two independent `numpy.random.SeedSequence` streams:
+
+* **`data_seeds`**: one per `(dataset, n_samples, repeat_idx)` triple. Used by `_resolve_dataset` so every estimator in the same repeat sees the same data draw, and to create the same train/test split for those estimators. Different repeats receive different data seeds. Recorded in the `data_seed` results column.
+* **`estimator_seeds`**: one per `(dataset, n_samples, repeat_idx, estimator)` task. Injected into the cloned estimator via `set_params(seed=estimator_seed)` if the estimator accepts a `seed` parameter. Recorded in the `estimator_seed` results column.
+
+Both seeds are stored in `results_` so that any individual row can be reproduced from the CSV alone.
+
+```python
+import numpy as np
+
+def _generate_seeds(seed_sequence, n):
+    """Generate n independent integer seeds from a SeedSequence stream."""
+    return [int(child.generate_state(1)[0]) for child in seed_sequence.spawn(n)]
+```
+
+**Running one task.** A task clones and fits one estimator, then evaluates each metric. It returns a list of long-format rows. The learned graph is passed directly to metrics rather than reconstructing from edges, preserving isolated nodes. This keeps estimator state local to the task, avoids nested parallelism, and lets one metric fail without hiding the other results:
 
 ```python
 import time
 from sklearn.base import clone
 from sklearn.model_selection import train_test_split as sk_train_test_split
 
-def _run_one_task(dataset_label, dataset, n_samples, estimator, metrics, train_test_split, seed, outer_n_jobs):
+def _run_one_task(
+    dataset_label, dataset, n_samples, repeat_idx,
+    estimator, metrics, train_test_split,
+    data_seed, estimator_seed, outer_n_jobs,
+):
     base_row = {
         "dataset": dataset_label,
         "n_samples": n_samples,
         "n_samples_actual": dataset.data.shape[0],
+        "repeat_idx": repeat_idx,
+        "data_seed": data_seed,
+        "estimator_seed": estimator_seed,
         "estimator": repr(estimator),
     }
     try:
         train_df, test_df = dataset.data, dataset.data
         if train_test_split is not None:
             train_df, test_df = sk_train_test_split(
-                dataset.data, train_size=train_test_split, random_state=seed
+                dataset.data, train_size=train_test_split, random_state=data_seed
             )
 
         fitted = clone(estimator)
-        if outer_n_jobs != 1 and "n_jobs" in fitted.get_params(deep=False):
+        params = fitted.get_params(deep=False)
+        if outer_n_jobs != 1 and "n_jobs" in params:
             fitted.set_params(n_jobs=1)
+        if "seed" in params:
+            fitted.set_params(seed=estimator_seed)
         start = time.perf_counter()
         fitted.fit(train_df)
         runtime_sec = time.perf_counter() - start
@@ -168,29 +202,6 @@ def _run_one_task(dataset_label, dataset, n_samples, estimator, metrics, train_t
         name = metric.get_tag("name", repr(metric), raise_error=False)
         metric_row = {**base_row, "metric": name, "runtime_sec": runtime_sec}
         needs_truth = metric.get_tag("requires_true_graph", False, raise_error=False)
-        supported_types = metric.get_tag("supported_graph_types", (), raise_error=False)
-        if needs_truth and dataset.ground_truth is None:
-            rows.append(
-                {
-                    **metric_row,
-                    "component": None,
-                    "value": None,
-                    "status": "skipped",
-                    "error": "no ground truth",
-                }
-            )
-            continue
-        if not isinstance(fitted.causal_graph_, supported_types):
-            rows.append(
-                {
-                    **metric_row,
-                    "component": None,
-                    "value": None,
-                    "status": "skipped",
-                    "error": "unsupported graph type",
-                }
-            )
-            continue
         try:
             if needs_truth:
                 value = metric.evaluate(true_causal_graph=dataset.ground_truth, est_causal_graph=fitted.causal_graph_)
@@ -224,6 +235,7 @@ def _run_one_task(dataset_label, dataset, n_samples, estimator, metrics, train_t
 **The `CausalDiscoveryBenchmark` class itself:**
 
 ```python
+import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 from pgmpy.causal_discovery._base import BaseCausalDiscovery
@@ -235,55 +247,79 @@ class CausalDiscoveryBenchmark:
         datasets,
         metrics,
         n_samples=None,
+        n_repeats: int = 1,
         ground_truth: dict | None = None,
         train_test_split: float | None = None,
-        seed: int = 42,
         n_jobs: int = -1,
         show_progress: bool = True,
+        seed: int = 42,
     ):
         if not all(isinstance(estimator, BaseCausalDiscovery) for estimator in estimators):
             raise TypeError("estimators must contain BaseCausalDiscovery instances")
+        if not isinstance(n_repeats, int) or n_repeats < 1:
+            raise ValueError(f"n_repeats must be a positive integer, got {n_repeats!r}")
         self.estimators = estimators
         self.datasets = datasets
         self.metrics = _resolve_metrics(metrics)
         self.n_samples = n_samples if isinstance(n_samples, list) else [n_samples]
+        self.n_repeats = n_repeats
         self.ground_truth = ground_truth or {}
         self.train_test_split = train_test_split
-        self.seed = seed
         self.n_jobs = n_jobs
         self.show_progress = show_progress
+        self.seed = seed
 
     def run(self, n_jobs=None, show_progress=None) -> "CausalDiscoveryBenchmark":
         n_jobs = self.n_jobs if n_jobs is None else n_jobs
         show_progress = self.show_progress if show_progress is None else show_progress
 
-        tasks = []
+        # Build the grid of (dataset_spec, n_samples, repeat_idx) triples.
+        data_specs = []
         for dataset_spec in self.datasets:
             for n in self.n_samples:
-                label, dataset = _resolve_dataset(dataset_spec, n, self.seed)
-                if dataset.ground_truth is None and label in self.ground_truth:
-                    dataset.ground_truth = self.ground_truth[label]
-                for estimator in self.estimators:
-                    tasks.append((label, dataset, n, estimator))
+                for repeat_idx in range(self.n_repeats):
+                    data_specs.append((dataset_spec, n, repeat_idx))
+
+        # Two independent seed streams from the master seed.
+        ss = np.random.SeedSequence(self.seed)
+        data_ss, est_ss = ss.spawn(2)
+        data_seeds = _generate_seeds(data_ss, len(data_specs))
+        est_seeds = _generate_seeds(est_ss, len(data_specs) * len(self.estimators))
+
+        # Resolve datasets and build task list.
+        tasks = []
+        est_seed_idx = 0
+        for spec_idx, (dataset_spec, n, repeat_idx) in enumerate(data_specs):
+            data_seed = data_seeds[spec_idx]
+            label, dataset = _resolve_dataset(dataset_spec, n, data_seed)
+            if dataset.ground_truth is None and label in self.ground_truth:
+                dataset.ground_truth = self.ground_truth[label]
+            for estimator in self.estimators:
+                tasks.append(
+                    (label, dataset, n, repeat_idx, estimator,
+                     data_seed, est_seeds[est_seed_idx])
+                )
+                est_seed_idx += 1
 
         task_rows = Parallel(n_jobs=n_jobs, verbose=10 if show_progress else 0)(
             delayed(_run_one_task)(
-                label, dataset, n, estimator, self.metrics, self.train_test_split, self.seed, n_jobs
+                label, dataset, n, repeat_idx, estimator, self.metrics,
+                self.train_test_split, data_seed, est_seed, n_jobs
             )
-            for label, dataset, n, estimator in tasks
+            for label, dataset, n, repeat_idx, estimator, data_seed, est_seed in tasks
         )
         self.results_ = pd.DataFrame([row for rows in task_rows for row in rows])
         return self
 
     def summary(self) -> pd.DataFrame:
-        """Return a wide estimator-by-dataset view of successful metric values."""
+        """Return a wide estimator-by-dataset view of successful metric values, averaged across repeats."""
         successful = self.results_.query("status == 'ok'").copy()
         successful["metric_component"] = successful["metric"] + "." + successful["component"]
         return successful.pivot_table(
             index=["estimator", "dataset", "n_samples"],
             columns="metric_component",
             values="value",
-            aggfunc="first",
+            aggfunc="mean",
         ).reset_index()
 
     def to_csv(self, path, **kwargs):
@@ -300,14 +336,17 @@ class CausalDiscoveryBenchmark:
 | `dataset` | dataset label — the string name, or `repr()` of a simulator instance |
 | `n_samples` | the requested sweep value (grouping key; use this for e.g. a metric-vs-n_samples plot) |
 | `n_samples_actual` | rows actually loaded — differs from `n_samples` only when a static dataset is smaller than requested (existing `load_dataset` warn-and-cap behavior) |
+| `repeat_idx` | zero-based index identifying which repeat this row belongs to (0 when `n_repeats=1`) |
+| `data_seed` | the seed used to generate the dataset for this repeat — shared by all estimators in the same `(dataset, n_samples, repeat_idx)` group |
+| `estimator_seed` | the seed injected into this estimator via `set_params(seed=...)` — unique per `(dataset, n_samples, repeat_idx, estimator)` task |
 | `estimator` | `repr()` of the estimator instance |
 | `metric` | metric tag name, such as `SHD` or `adjacency_confusion_matrix` |
 | `component` | `value` for scalar metrics, or a dictionary key such as `precision` |
 | `value` | scalar result value |
 | `runtime_sec` | wall-clock time for fitting the estimator |
-| `status` | `"ok"`, `"skipped"`, or `"error"` |
+| `status` | `"ok"` or `"error"` |
 | `error_type` | exception class when the status is `"error"` |
-| `error` | skip reason or exception message when the status is not `"ok"` |
+| `error` | exception message when the status is `"error"` |
 
 ### User journeys with the solution
 
@@ -315,7 +354,6 @@ class CausalDiscoveryBenchmark:
 
 ```python
 from pgmpy.causal_discovery import GES, PC
-from pgmpy.datasets.linear_gaussian_scm import LinearGaussianSCM
 from pgmpy.metrics import SHD
 
 benchmark = CausalDiscoveryBenchmark(
@@ -323,8 +361,8 @@ benchmark = CausalDiscoveryBenchmark(
         PC(ci_test="pearsonr", return_type="dag", max_cond_vars=5),
         GES(scoring_method="bic-g", return_type="dag"),
     ],
-    datasets=[LinearGaussianSCM(n_nodes=10, edge_prob=0.3, seed=42)],
-    metrics=[SHD],
+    datasets=["linear_gaussian_scm"],
+    metrics=[SHD()],
 ).run()
 benchmark.summary()
 ```
@@ -332,14 +370,17 @@ benchmark.summary()
 **2. Sweeping sample sizes**, to see how each method's accuracy changes with more data:
 
 ```python
+from pgmpy.metrics import StructureScore
+
 CausalDiscoveryBenchmark(
     estimators=[
         PC(ci_test="pearsonr", return_type="dag"),
         GES(scoring_method="bic-g", return_type="dag"),
     ],
-    datasets=[LinearGaussianSCM(n_nodes=10, edge_prob=0.3)],
-    metrics=[SHD, StructureScore],
+    datasets=["linear_gaussian_scm"],
+    metrics=[SHD(), StructureScore()],
     n_samples=[200, 500, 1000, 5000],
+    n_repeats=10,
 ).run().results_
 ```
 
@@ -349,7 +390,7 @@ CausalDiscoveryBenchmark(
 CausalDiscoveryBenchmark(
     estimators=[PC(ci_test="pearsonr", return_type="dag"), GES(return_type="dag")],
     datasets=["some_real_dataset_without_dagitty_ground_truth"],
-    metrics=[SHD],
+    metrics=[SHD()],
     ground_truth={"some_real_dataset_without_dagitty_ground_truth": my_known_dag},
 ).run()
 ```
@@ -359,19 +400,28 @@ CausalDiscoveryBenchmark(
 ```python
 CausalDiscoveryBenchmark(
     estimators=[PC(ci_test="pearsonr", return_type="dag"), HillClimbSearch(scoring_method="bic-g")],
-    datasets=[LinearGaussianSCM(n_nodes=8, edge_prob=0.3, seed=42)],
-    metrics=[StructureScore],
+    datasets=["linear_gaussian_scm"],
+    metrics=[StructureScore()],
     train_test_split=0.7,
 ).run()
 ```
 
-**5. Reading off a skipped metric** — one dataset has no ground truth while another runs cleanly:
+**5. Averaging over repeated runs** — with `n_repeats=10`, the raw `results_` contains one row per repeat while `.summary()` averages across repeats:
 
 ```python
->>> benchmark.results_[["dataset", "metric", "status", "error"]]
-     dataset               metric  status    error
-0    LinearGaussianSCM(...) SHD    ok        None
-1    some_dataset_no_gt    SHD     skipped   no ground truth
+>>> benchmark = CausalDiscoveryBenchmark(
+...     estimators=[PC(ci_test="pearsonr", return_type="dag")],
+...     datasets=["linear_gaussian_scm"],
+...     metrics=[SHD()],
+...     n_samples=[500, 1000],
+...     n_repeats=10,
+... ).run()
+>>> benchmark.results_[["dataset", "n_samples", "repeat_idx", "data_seed", "metric", "value"]].head()
+     dataset              n_samples  repeat_idx  data_seed    metric  value
+0    linear_gaussian_scm   500       0           291839481    SHD     4.0
+1    linear_gaussian_scm   500       1           839104726    SHD     3.0
+...
+>>> benchmark.summary()  # averages across repeat_idx
 ```
 
 **6. Persisting raw benchmark results:**
@@ -382,14 +432,25 @@ benchmark.to_csv("results/linear_gaussian.csv")
 
 ### Open Questions
 
-* **Repeats across stochastic simulators.** A single draw from a simulator is noisy; averaging over several seeds per `(dataset, estimator, n_samples)` cell would make comparisons more reliable, similar to `ci_benchmarks`' existing `n_repeats`. Phase 1 uses the benchmark `seed` for string dataset generation and train/test splitting; initialized simulators and stochastic estimator settings remain explicit user configuration. A future `n_repeats` API should define a per-task seed schedule.
 * **Per-task timeouts.** Some estimator/dataset combinations may hang rather than error (e.g. an exhaustive search on a large graph). Not addressed here.
-* **Distributed execution.** Dask or Ray can be considered after local execution is tested. They should remain optional joblib-compatible backends rather than dependencies of CausalEval.
+* **Simulator seed contract for `n_repeats`.** Phase 1's `n_repeats` produces independent data draws only for string (registered) datasets, because `load_dataset(..., seed=data_seed)` creates a fresh simulator per call. Initialized `BaseSimulatedDataset` instances do not currently accept an external seed for per-repeat resampling. Phase 2 should extend the simulator contract (e.g. a `reseed(seed)` method or a factory/configuration API) so that `n_repeats` works reliably with initialized instances as well.
+* **Distributed execution.** `joblib` supports pluggable backends (`joblib.parallel_config(backend="dask")`). The same `Parallel(n_jobs=...)` calls in `CausalDiscoveryBenchmark.run()` can dispatch tasks to a Dask or Ray cluster, but this requires: (a) installing and registering the backend (`pip install dask distributed`), (b) ensuring estimator, metric, and dataset objects are serializable across workers, and (c) integration testing before calling the backend supported. The initial implementation uses local CPU parallelism only. A Dask example:
+
+    ```python
+    from joblib import parallel_config
+    from dask.distributed import Client
+
+    client = Client("scheduler-address:8786")
+    with parallel_config(backend="dask"):
+        benchmark.run()
+    ```
+
+    This will be documented as a supported extension once serialization and an integration test are in place.
 * **Publishing to `pgmpy.org/causalbench`.** The runner writes a stable CSV in Phase 1. Wiring that output into the `web/` dashboard remains a separate follow-up.
 * **Module name.** `cd_benchmarks` mirrors the existing `ci_benchmarks` naming, but `causal_discovery_benchmarks` is more explicit — open to either.
 
 ### Rollout plan
 
-* **Phase 1:** `CausalDiscoveryBenchmark` core — input validation, dataset resolution, cloned local `joblib` tasks, `train_test_split`, ground-truth overrides, long-format `results_`, `.summary()`, and `.to_csv()`. Tests cover scalar and dictionary metrics, missing ground truth, unsupported graph types, metric-level errors, isolated nodes, and static versus simulated datasets.
-* **Phase 2:** Repeated runs with an explicit seed schedule and per-task timeouts.
-* **Phase 3:** Optional distributed-backend documentation and dashboard integration using the CSV output convention already used by `ci_benchmarks`.
+* **Phase 1:** `CausalDiscoveryBenchmark` core — input validation, dataset resolution (string datasets only for reliable `n_repeats`), cloned local `joblib` tasks, `n_repeats` with `SeedSequence`-based dual seed streams (`data_seed` + `estimator_seed`), seed injection into estimators via `set_params`, `train_test_split`, ground-truth overrides, long-format `results_` with seed columns for reproducibility, `.summary()`, and `.to_csv()`. Tests cover scalar and dictionary metrics, missing ground truth, unsupported graph types, metric-level errors, isolated nodes, repeated runs, and static versus simulated datasets.
+* **Phase 2:** Simulator seed contract for `n_repeats` with initialized instances. Per-task timeouts. Distributed-backend documentation with Dask/Ray integration test.
+* **Phase 3:** Dashboard integration using the CSV output convention already used by `ci_benchmarks`.
