@@ -98,9 +98,9 @@ The label for a string is its name; the label for a `Dataset` or `BaseSimulatedD
 
 See `prototype.py` for the full `_resolve_dataset` implementation.
 
-**Resolving metrics.** The benchmark accepts metric instances only (e.g. `SHD()`, `SHD(edge_reverse_penalty=2)`). Passing an uninstantiated class raises a `TypeError` with a message telling the user to add `()`. Applicability is read from each metric's `requires_true_graph`, `requires_data`, and `supported_graph_types` tags.
+**Resolving metrics.** `metrics` accepts a list of metric instances or a dictionary mapping names to instances. Lists use each metric's `name` tag; dictionaries use their keys. Duplicate names in a list raise a `ValueError` before execution, asking for a dictionary with distinct names (e.g. `{"shd": SHD(), "shd_double": SHD(edge_reverse_penalty=2)}`). Both forms normalize to a dictionary whose keys identify metrics in `results_` and `.summary()`. Passing an uninstantiated class raises a `TypeError` with a message telling the user to add `()`. Applicability is read from each metric's `requires_true_graph`, `requires_data`, and `supported_graph_types` tags.
 
-See `prototype.py` for the full `_resolve_metrics` implementation.
+See `prototype.py` for the current `_resolve_metrics` implementation.
 
 **Seed propagation.** The benchmark's `seed` drives two independent `numpy.random.SeedSequence` streams:
 
@@ -128,7 +128,7 @@ See `prototype.py` for the full class implementation.
 | `data_seed` | seed for data generation — shared by all estimators in the same `(dataset, n_samples, repeat_idx)` group |
 | `estimator_seed` | seed injected into this estimator via `set_params(seed=...)` — unique per task |
 | `estimator` | `repr()` of the estimator instance |
-| `metric` | metric name (e.g. `SHD`) |
+| `metric` | metric identifier: the `name` tag for list inputs or the supplied key for dictionary inputs |
 | `value` | scalar float result |
 | `runtime_sec` | wall-clock time for fitting the estimator |
 | `status` | `"ok"` or `"error"` |
